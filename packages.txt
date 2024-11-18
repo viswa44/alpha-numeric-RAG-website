@@ -1,0 +1,5 @@
+libportaudio2
+portaudio19-dev
+libasound2-dev
+ffmpeg
+libavcodec-extra
