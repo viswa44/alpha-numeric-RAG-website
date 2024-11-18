@@ -7,56 +7,89 @@ import google.generativeai as genai
 from langchain.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
 import pandas as pd
-import speech_recognition as sr  # For voice-to-text transcription
+from google.cloud import storage
+import tarfile
+import shutil
+from pydub import AudioSegment
+import speech_recognition as sr
 from extract_tables_json import extract_tables_from_pdfs
+from work2 import embed_extracted_tables
+
 # Load environment variables
 load_dotenv()
 google_api_key = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=google_api_key)
 
-# Function to check microphone (optional)
-def transcribe_voice():
-    """Converts spoken input to text using the SpeechRecognition library."""
-    recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        st.info("Listening... Please speak now.")
-        try:
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
-            text = recognizer.recognize_google(audio)
-            st.success(f"You said: {text}")
-            return text
-        except sr.UnknownValueError:
-            st.error("Could not understand audio.")
-        except sr.RequestError as e:
-            st.error(f"Voice recognition error: {e}")
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-    return None
+# Google Cloud Storage setup
+storage_client = storage.Client()
+bucket_name = "bucket-rag4521"  # Replace with your GCP bucket name
 
-# Function to process tables into embeddings
-def embed_extracted_tables(output_folder):
-    """Reads JSON files (extracted tables) from the output folder and creates embeddings."""
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    table_chunks = []
 
-    for file_name in os.listdir(output_folder):
-        if file_name.endswith(".json"):
-            file_path = os.path.join(output_folder, file_name)
-            try:
-                table_data = pd.read_json(file_path)
-                table_text = table_data.to_string(index=False)
-                table_chunks.append(table_text)
-            except Exception as e:
-                st.error(f"Error processing {file_name}: {e}")
-    
-    return table_chunks
+# Utility functions
+def compress_directory(directory_path, tar_file_path):
+    """Compress a directory into a tar.gz file."""
+    try:
+        with tarfile.open(tar_file_path, "w:gz") as tar:
+            for root, _, files in os.walk(directory_path):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    arcname = os.path.relpath(full_path, start=directory_path)
+                    tar.add(full_path, arcname=arcname)
+        st.info(f"Compressed {directory_path} into {tar_file_path}.")
+    except Exception as e:
+        st.error(f"Error compressing directory: {e}")
 
-# Function to extract text from PDFs
-def get_pdf_text(pdf_docs):
-    """Extracts text from each page of uploaded PDF files."""
+
+def decompress_tar(tar_file_path, extract_to_path):
+    """Decompress a tar.gz file."""
+    try:
+        with tarfile.open(tar_file_path, "r:gz") as tar:
+            tar.extractall(path=extract_to_path)
+        st.info(f"Decompressed {tar_file_path} to {extract_to_path}.")
+    except Exception as e:
+        st.error(f"Error decompressing tar file: {e}")
+
+
+def upload_to_gcs(local_path, gcs_path):
+    """Upload a file to Google Cloud Storage."""
+    try:
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_path)
+
+        # Delete existing object if exists
+        if blob.exists():
+            blob.delete()
+            st.info(f"Deleted existing file at {gcs_path}.")
+
+        blob.upload_from_filename(local_path)
+        st.success(f"Uploaded file to {gcs_path}.")
+    except Exception as e:
+        st.error(f"Error uploading file to GCS: {e}")
+
+
+def download_from_gcs(gcs_path, local_path):
+    """Download a file from Google Cloud Storage."""
+    try:
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_path)
+
+        if blob.exists():
+            blob.download_to_filename(local_path)
+            st.info(f"Downloaded file from {gcs_path}.")
+            return True
+        else:
+            st.warning(f"No file found at {gcs_path}.")
+            return False
+    except Exception as e:
+        st.error(f"Error downloading file from GCS: {e}")
+        return False
+
+
+# PDF processing
+def extract_text_from_pdfs(pdf_docs):
+    """Extract text from uploaded PDFs."""
     text = ""
     for pdf in pdf_docs:
         pdf_reader = PdfReader(pdf)
@@ -64,53 +97,143 @@ def get_pdf_text(pdf_docs):
             text += page.extract_text() or ""
     return text
 
-# Function to split text into chunks
-def get_text_chunks(text):
-    """Splits the extracted text into manageable chunks."""
+
+def split_text_into_chunks(text):
+    """Split text into smaller chunks."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     return text_splitter.split_text(text)
 
-# Function to combine text and table chunks into FAISS vector store
-def get_combined_vector_store(text_chunks, table_chunks):
-    """Combines text and table chunks and creates a unified FAISS vector store."""
+
+# FAISS and embedding
+def create_and_upload_vector_store(text_chunks, table_chunks):
+    """Create FAISS vector store and upload to GCS."""
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     all_chunks = text_chunks + table_chunks
-    try:
-        vector_store = FAISS.from_texts(all_chunks, embedding=embeddings)
-        vector_store.save_local("faiss_index_combined")
-        st.success("Combined FAISS vector store created and saved.")
-    except Exception as e:
-        st.error(f"Error creating FAISS vector store: {e}")
+    local_dir = "faiss_index_combined"
+    tar_file = "faiss_index_combined.tar.gz"
+    gcs_path = "faiss_index_combined.tar.gz"
 
-# Function for conversational QA chain
-def user_input(user_question):
-    """Handles the user's question by searching the combined FAISS index and generating a response."""
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     try:
-        new_db = FAISS.load_local("faiss_index_combined", embeddings)
-        docs = new_db.similarity_search(user_question, k=5)
-        st.write("Retrieved Context:")
-        for doc in docs:
-            st.write(f"- {doc.page_content}")
-        chain = load_qa_chain(ChatGoogleGenerativeAI(model="gemini-1.5-pro"), chain_type="stuff")
-        response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
-        st.write("Reply:", response["output_text"])
+        # Clean and prepare local directory
+        if os.path.exists(local_dir):
+            shutil.rmtree(local_dir)
+        os.makedirs(local_dir)
+
+        # Create FAISS index
+        vector_store = FAISS.from_texts(all_chunks, embedding=embeddings)
+        vector_store.save_local(local_dir)
+
+        # Verify files saved
+        if not os.path.exists(f"{local_dir}/index.faiss"):
+            st.error("FAISS index was not saved correctly.")
+            return
+
+        # Compress and upload to GCS
+        compress_directory(local_dir, tar_file)
+        upload_to_gcs(tar_file, gcs_path)
+
+        # Clean up local files
+        os.remove(tar_file)
+        shutil.rmtree(local_dir)
+    except Exception as e:
+        st.error(f"Error creating or uploading FAISS vector store: {e}")
+
+
+# Conversational QA
+def process_user_query(user_question):
+    """Process user query with FAISS and conversational AI."""
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    tar_file = "faiss_index_combined.tar.gz"
+    local_dir = "faiss_index_combined"
+    gcs_path = "faiss_index_combined.tar.gz"
+
+    try:
+        if download_from_gcs(gcs_path, tar_file):
+            decompress_tar(tar_file, local_dir)
+
+            if not os.path.exists(f"{local_dir}/index.faiss"):
+                st.error("FAISS index is missing after decompression.")
+                return
+
+            vector_store = FAISS.load_local(local_dir, embeddings, allow_dangerous_deserialization=True)
+            docs = vector_store.similarity_search(user_question, k=5)
+            st.write("Retrieved Context:")
+            for doc in docs:
+                st.write(f"- {doc.page_content}")
+
+            chain = load_qa_chain(ChatGoogleGenerativeAI(model="gemini-1.5-pro"), chain_type="stuff")
+            response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
+            st.write("Reply:", response["output_text"])
+
+            os.remove(tar_file)
+            shutil.rmtree(local_dir)
+        else:
+            st.error("Failed to load FAISS index. Please process PDFs first.")
     except Exception as e:
         st.error(f"Error during query processing: {e}")
 
-# Main function
-def main():
-    st.set_page_config(page_title="My Application", page_icon="💻", layout="wide")
-    st.sidebar.title("Navigation")
-    pages = ["Blog", "Chat with PDF"]
-    selected_page = st.sidebar.radio("Choose a Page:", pages)
 
-    if selected_page == "Blog":
-        render_blog()
-    elif selected_page == "Chat with PDF":
-        render_chat()
+# Audio transcription
+def convert_audio_to_wav(audio_file):
+    """Convert audio to WAV format."""
+    try:
+        audio = AudioSegment.from_file(audio_file)
+        converted_file = "converted_audio.wav"
+        audio.export(converted_file, format="wav")
+        return converted_file
+    except Exception as e:
+        st.error(f"Error converting audio file: {e}")
+        return None
 
-# Blog Page
+
+def transcribe_audio(audio_file):
+    """Transcribe audio file to text."""
+    recognizer = sr.Recognizer()
+    try:
+        converted_file = convert_audio_to_wav(audio_file)
+        if not converted_file:
+            return None
+
+        with sr.AudioFile(converted_file) as source:
+            st.info("Processing the audio file for transcription...")
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data)
+            st.success(f"Transcribed Text: {text}")
+            return text
+    except sr.UnknownValueError:
+        st.error("Speech Recognition could not understand the audio.")
+    except sr.RequestError as e:
+        st.error(f"Error with Speech Recognition service: {e}")
+    except Exception as e:
+        st.error(f"An error occurred during transcription: {e}")
+    return None
+
+
+# Streamlit pages
+def render_chat():
+    st.title("Chat with PDF using Gemini LLM")
+
+    # PDF Upload
+    pdf_docs = st.file_uploader("Upload your PDF files", accept_multiple_files=True, type=["pdf"])
+    if pdf_docs and st.button("Process PDFs"):
+        text = extract_text_from_pdfs(pdf_docs)
+        text_chunks = split_text_into_chunks(text)
+        table_chunks = embed_extracted_tables("extracted_tables")
+        create_and_upload_vector_store(text_chunks, table_chunks)
+
+    # Text Query
+    user_question = st.text_input("Enter your question:")
+    if st.button("Submit Question"):
+        process_user_query(user_question)
+
+    # Audio Upload
+    audio_file = st.file_uploader("Upload an audio file for transcription (e.g., WAV, MP3)", type=["wav", "mp3", "flac"])
+    if audio_file and st.button("🎙️ Transcribe Audio and Query"):
+        transcription = transcribe_audio(audio_file)
+        if transcription:
+            process_user_query(transcription)
+
+
 def render_blog():
     st.title("Welcome to Demo Project")
     st.sidebar.title("Topics of project")
@@ -141,7 +264,6 @@ def render_blog():
         ### Conclusion:
         By integrating PDF processing, embeddings, and conversational AI, this project provides an efficient way to interact with documents.
         """)
-
     elif choice == "Challenges":
         st.header("Challenges with Poorly Structured Data")
         st.write("""
@@ -156,7 +278,6 @@ def render_blog():
 
         **Addressing these challenges** requires robust pre-processing, advanced embeddings, and hybrid systems combining rule-based and AI methods.
         """)
-
     elif choice == "Contact Me":
         st.header("Contact Me")
         st.markdown("""
@@ -166,78 +287,17 @@ def render_blog():
         - **LinkedIn**: [Viswatej's Profile](https://www.linkedin.com/in/viswatej-varma-55335b169/)
         """)
 
-# Chat Page
-def render_chat():
-    st.title("Chat with PDF using Gemini LLM")
-    st.write("""
-    Upload your PDF documents and interact with them using advanced AI features like table extraction, embeddings, and conversational AI.
-    """)
 
-    with st.sidebar:
-        st.write("### Upload your PDF Files:")
-        pdf_docs = st.file_uploader(
-            label="Choose PDF files",
-            accept_multiple_files=True,
-            type=["pdf"],
-            help="You can upload multiple PDF files for processing."
-        )
-        
-        if pdf_docs:
-            st.write("Uploaded Files:")
-            for pdf in pdf_docs:
-                st.write(f"📄 {pdf.name}")
-        
-        if st.button("Submit & Process"):
-            if not pdf_docs:
-                st.warning("Please upload at least one PDF file before proceeding.")
-                return
-            
-            with st.spinner("Processing..."):
-                try:
-                    input_folder = "uploaded_pdfs"
-                    output_folder = "extracted_tables"
-                    os.makedirs(input_folder, exist_ok=True)
-                    os.makedirs(output_folder, exist_ok=True)
+def main():
+    st.sidebar.title("Navigation")
+    pages = ["Blog", "Chat with PDFs"]
+    selected_page = st.sidebar.radio("Choose a Page:", pages)
 
-                    # Save uploaded PDFs to the input folder
-                    for pdf in pdf_docs:
-                        file_path = os.path.join(input_folder, pdf.name)
-                        with open(file_path, "wb") as f:
-                            f.write(pdf.read())
-                        st.write(f"✅ Saved: {pdf.name}")
+    if selected_page == "Blog":
+        render_blog()
+    elif selected_page == "Chat with PDFs":
+        render_chat()
 
-                    # Extract tables from the PDFs
-                    st.info("Extracting tables from PDFs...")
-                    extract_tables_from_pdfs(input_folder, output_folder)
-                    st.success("Table extraction complete. JSON files created.")
-
-                    # Embed extracted tables and process raw text
-                    st.info("Embedding tables...")
-                    table_chunks = embed_extracted_tables(output_folder)
-                    
-                    st.info("Extracting text from PDFs...")
-                    raw_text = get_pdf_text(pdf_docs)
-                    text_chunks = get_text_chunks(raw_text)
-
-                    # Combine text and table chunks into FAISS vector store
-                    st.info("Combining text and table embeddings...")
-                    get_combined_vector_store(text_chunks, table_chunks)
-
-                    st.success("Processing complete! You can now ask questions.")
-
-                except Exception as e:
-                    st.error(f"An error occurred: {e}")
-
-    # User interaction
-    st.write("## Ask a Question from the PDF Files")
-    user_question = st.text_input("Type your question below or click the microphone for voice input:")
-    if st.button("🎙️ Speak"):
-        spoken_question = transcribe_voice()
-        if spoken_question:
-            user_input(spoken_question)
-
-    if user_question:
-        user_input(user_question)
 
 if __name__ == "__main__":
     main()
