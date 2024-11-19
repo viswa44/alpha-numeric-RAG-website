@@ -14,8 +14,9 @@ import tarfile
 import shutil
 from pydub import AudioSegment
 import speech_recognition as sr
-# from extract_tables_json import extract_tables_from_pdfs
+from extract_tables_json import extract_tables_from_pdfs
 from work2 import embed_extracted_tables
+print(os.listdir("."))
 
 # Load environment variables
 load_dotenv()
