@@ -1,0 +1,2 @@
+runtime: python311  # Specify your Python runtime version
+entrypoint: python final_duplicate.py  # Command to run your application
